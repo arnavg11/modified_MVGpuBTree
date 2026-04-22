@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -272,7 +272,7 @@ __global__ void concurrent_insert_range_kernel(const key_type* keys,
       auto first_tile_thread_id = tile_id * btree::branching_factor;
 
       auto work_queue = tile.ballot(to_find);
-      uint32_t timestamp;  // one timestamp per find tile
+      typename btree::snapshot_type timestamp;  // one snapshot_type timestamp per find tile
 
       reclaimer.leave_qstate(block_wide_tile, blockIdx.x, allocator, tree.allocator_);
 #ifdef DEBUG_QS_ENTER_EXIST
@@ -313,7 +313,7 @@ __global__ void range_query_kernel(const key_type* lower_bounds,
                                    const size_type keys_count,
                                    btree tree,
                                    size_type* counts,
-                                   const size_type timestamp,
+                                   const typename btree::snapshot_type timestamp,
                                    bool concurrent = false) {
   auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -361,6 +361,7 @@ __global__ void range_query_kernel(const key_type* lower_bounds,
 }
 
 template <typename key_type, typename value_type, typename size_type, typename btree>
+__launch_bounds__(256, 4)
 __global__ void insert_in_place_kernel(const key_type* keys,
                                        const value_type* values,
                                        const size_type keys_count,
@@ -399,6 +400,7 @@ __global__ void insert_in_place_kernel(const key_type* keys,
 }
 
 template <typename key_type, typename value_type, typename size_type, typename btree>
+__launch_bounds__(128, 4)
 __global__ void insert_out_of_place_kernel(const key_type* keys,
                                            const value_type* values,
                                            const size_type num_insertions,
@@ -482,7 +484,7 @@ __global__ void find_kernel(const key_type* keys,
                             value_type* values,
                             const size_type keys_count,
                             btree tree,
-                            const size_type time_stamp,
+                            const typename btree::snapshot_type time_stamp,
                             bool concurrent = false) {
   using pair_type = typename btree::pair_type;
 

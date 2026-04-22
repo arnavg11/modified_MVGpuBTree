@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,8 @@
 
 // #define DEBUG_LOCKING
 // #define DEBUG_CHECKS
-template <typename pair_type, typename tile_type, int node_width = 16>
+template <typename pair_type, typename tile_type, int node_width = 16,
+          typename snapshot_type = uint32_t>
 struct btree_versioned_node {
   using key_type   = typename pair_type::key_type;
   using value_type = typename pair_type::value_type;
@@ -44,19 +45,19 @@ struct btree_versioned_node {
       , is_locked_(is_locked)
       , is_intermediate_(is_intermediate) {}
 
-  DEVICE_QUALIFIER void store_unlocked_copy_at(pair_type* ptr) {
+  DEVICE_NOINLINE_QUALIFIER void store_unlocked_copy_at(pair_type* ptr) {
     auto to_store = lane_pair_;
     if (tile_.thread_rank() == metadata_lane_) { to_store.second = mask_lock_bit(to_store.second); }
     cuda_memory<pair_type>::store(
         ptr + tile_.thread_rank(), to_store, cuda_memory_order::memory_order_relaxed);
   }
 
-  DEVICE_QUALIFIER void load(cuda_memory_order order = cuda_memory_order::memory_order_weak) {
+  DEVICE_NOINLINE_QUALIFIER void load(cuda_memory_order order = cuda_memory_order::memory_order_weak) {
     lane_pair_       = cuda_memory<pair_type>::load(node_ptr_ + tile_.thread_rank(), order);
     is_intermediate_ = !(get_sibling_data() & leaf_bit_mask_);
     is_locked_       = (get_sibling_data() & lock_bit_mask_);
   }
-  DEVICE_QUALIFIER void store(cuda_memory_order order = cuda_memory_order::memory_order_weak) {
+  DEVICE_NOINLINE_QUALIFIER void store(cuda_memory_order order = cuda_memory_order::memory_order_weak) {
     cuda_memory<pair_type>::store(node_ptr_ + tile_.thread_rank(), lane_pair_, order);
     is_intermediate_ = !(get_sibling_data() & leaf_bit_mask_);
   }
@@ -86,10 +87,10 @@ struct btree_versioned_node {
   }
 
   template <typename size_type>
-  DEVICE_QUALIFIER btree_versioned_node do_split(const size_type right_sibling_index,
-                                                 pair_type* right_sibling_ptr,
-                                                 const bool make_sibling_locked = false,
-                                                 const bool is_intermediate     = true) {
+  DEVICE_NOINLINE_QUALIFIER btree_versioned_node do_split(const size_type right_sibling_index,
+                                                          pair_type* right_sibling_ptr,
+                                                          const bool make_sibling_locked = false,
+                                                          const bool is_intermediate     = true) {
     // find the two minimum keys
     auto sibling_minimum = get_key_from_lane(node_width >> 1);
     // prepare the upper half in right sibling
@@ -146,11 +147,11 @@ struct btree_versioned_node {
     btree_versioned_node sibling;
   };
   template <typename size_type>
-  DEVICE_QUALIFIER split_intermediate_result split(const size_type right_sibling_index,
-                                                   const size_type parent_index,
-                                                   pair_type* right_sibling_ptr,
-                                                   pair_type* parent_ptr,
-                                                   const bool make_sibling_locked = false) {
+  DEVICE_NOINLINE_QUALIFIER split_intermediate_result split(const size_type right_sibling_index,
+                                                            const size_type parent_index,
+                                                            pair_type* right_sibling_ptr,
+                                                            pair_type* parent_ptr,
+                                                            const bool make_sibling_locked = false) {
     // We assume here that the parent is locked
     auto split_result = do_split(right_sibling_index, right_sibling_ptr, make_sibling_locked);
 
@@ -182,11 +183,11 @@ struct btree_versioned_node {
     btree_versioned_node right;
   };
   template <typename size_type>
-  DEVICE_QUALIFIER two_nodes_result split_as_root(const size_type left_sibling_index,
-                                                  const size_type right_sibling_index,
-                                                  pair_type* left_sibling_ptr,
-                                                  pair_type* right_sibling_ptr,
-                                                  const bool make_children_locked = false) {
+  DEVICE_NOINLINE_QUALIFIER two_nodes_result split_as_root(const size_type left_sibling_index,
+                                                           const size_type right_sibling_index,
+                                                           pair_type* left_sibling_ptr,
+                                                           pair_type* right_sibling_ptr,
+                                                           const bool make_children_locked = false) {
     // Create a new root
     auto right_node_minimum = get_key_from_lane(node_width >> 1);
 
@@ -289,7 +290,7 @@ struct btree_versioned_node {
   DEVICE_QUALIFIER void set_pair_at_lane(const int& location, pair_type pair) {
     if (tile_.thread_rank() == location) { lane_pair_ = pair; }
   }
-  DEVICE_QUALIFIER bool insert(const key_type key, const value_type value) {
+  DEVICE_NOINLINE_QUALIFIER bool insert(const key_type key, const value_type value) {
 #ifdef DEBUG_CHECKS
     // Debug: check if key is larger than high key
     auto high_key = get_high_key();
@@ -321,7 +322,7 @@ struct btree_versioned_node {
     return true;
   }
 
-  DEVICE_QUALIFIER bool erase(const key_type key) {
+  DEVICE_NOINLINE_QUALIFIER bool erase(const key_type key) {
 #ifdef DEBUG_CHECKS
     // Debug: check if key is larger than high key
     auto high_key = get_high_key();
@@ -431,33 +432,40 @@ struct btree_versioned_node {
     return next_version_id;
   }
 
-  DEVICE_QUALIFIER key_type get_version_number() const {
-    // highkey is stored as key
+  DEVICE_QUALIFIER snapshot_type get_version_number() const {
     auto version_value = get_key_from_lane(version_lane_);
-    auto version       = *reinterpret_cast<key_type*>(&version_value);
-    return version;
+    return static_cast<snapshot_type>(version_value);
   }
 
-  DEVICE_QUALIFIER void set_version_ptr_data(size_type ts, size_type ptr) {
-    set_pair_at_lane(version_lane_, {ts, ptr});
+  DEVICE_QUALIFIER void set_version_ptr_data(snapshot_type ts, size_type ptr) {
+    set_pair_at_lane(version_lane_, {static_cast<key_type>(ts), static_cast<value_type>(ptr)});
   }
 
-  DEVICE_QUALIFIER void set_timestamp(size_type ts) { set_key_at_lane(version_lane_, ts); }
+  DEVICE_QUALIFIER void set_timestamp(snapshot_type ts) { set_key_at_lane(version_lane_, ts); }
 
   struct init_result {
     bool success;
-    size_type cur_ts;
+    snapshot_type cur_ts;
   };
   template <typename camera_type>
-  DEVICE_QUALIFIER init_result init(const size_type invalid_ts, camera_type& camera) {
+  DEVICE_NOINLINE_QUALIFIER init_result init(const snapshot_type invalid_ts, camera_type& camera) {
+    using camera_value_type =
+        typename std::remove_cv<typename std::remove_pointer<typename std::remove_reference<
+            camera_type>::type>::type>::type;
     auto node_ts = get_version_number();
     if (node_ts != invalid_ts) { return {true, node_ts}; }
-    auto cur_ts = cuda_memory<size_type>::load(camera, cuda_memory_order::memory_order_relaxed);
+    auto cur_ts_full =
+        cuda_memory<camera_value_type>::load(camera, cuda_memory_order::memory_order_relaxed);
+    if (cur_ts_full >= static_cast<camera_value_type>(invalid_ts)) {
+      asm volatile("trap;");
+    }
+    auto cur_ts = static_cast<snapshot_type>(cur_ts_full);
 
-    size_type old = invalid_ts;
+    snapshot_type old = invalid_ts;
     if (tile_.thread_rank() == version_lane_) {
-      old = atomicCAS(
-          reinterpret_cast<unsigned int*>(&node_ptr_[version_lane_].first), invalid_ts, cur_ts);
+      old = atomicCAS(reinterpret_cast<unsigned int*>(&node_ptr_[version_lane_].first),
+                      static_cast<unsigned int>(invalid_ts),
+                      static_cast<unsigned int>(cur_ts));
     }
     old          = tile_.shfl(old, version_lane_);
     bool success = old == invalid_ts;
@@ -525,13 +533,13 @@ struct btree_versioned_node {
 
   DEVICE_QUALIFIER bool is_intermediate() const { return is_intermediate_; }
 
-  DEVICE_QUALIFIER void lock() {
+  DEVICE_NOINLINE_QUALIFIER void lock() {
     while (auto failed = !try_lock()) {}
     is_locked_ = true;
   }
 
   // returns true if succeed
-  DEVICE_QUALIFIER bool try_lock() {
+  DEVICE_NOINLINE_QUALIFIER bool try_lock() {
     unsigned_type old;
     if (tile_.thread_rank() == metadata_lane_) {
       old = atomicOr(reinterpret_cast<unsigned int*>(&node_ptr_[metadata_lane_].second),
@@ -549,7 +557,7 @@ struct btree_versioned_node {
 
     return is_locked_;
   }
-  DEVICE_QUALIFIER void unlock() {
+  DEVICE_NOINLINE_QUALIFIER void unlock() {
     __threadfence();
     unsigned_type old;
     if (tile_.thread_rank() == metadata_lane_) {
@@ -569,8 +577,8 @@ struct btree_versioned_node {
 
   DEVICE_QUALIFIER pair_type get_pair() const { return lane_pair_; }
 
-  DEVICE_QUALIFIER btree_versioned_node<pair_type, tile_type, node_width>& operator=(
-      const btree_versioned_node<pair_type, tile_type, node_width>& other) {
+  DEVICE_QUALIFIER btree_versioned_node<pair_type, tile_type, node_width, snapshot_type>&
+  operator=(const btree_versioned_node<pair_type, tile_type, node_width, snapshot_type>& other) {
     node_ptr_        = other.node_ptr_;
     lane_pair_       = other.lane_pair_;
     is_locked_       = other.is_locked_;

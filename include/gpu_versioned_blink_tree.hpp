@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,6 +74,12 @@ template <typename Key,
           typename Allocator = device_bump_allocator<node_type<Key, Value, B>>>
 struct gpu_versioned_btree {
   using size_type                        = uint32_t;
+  // snapshot_type is the per-node/query-visible snapshot id. It stays 32-bit
+  // because the node layout stores {snapshot_id, next_version_ptr} in one pair.
+  using snapshot_type                    = size_type;
+  // snapshot_index_type is the backing global counter; it is 64-bit so the
+  // counter itself never wraps silently.
+  using snapshot_index_type              = uint64_t;
   using key_type                         = Key;
   using value_type                       = Value;
   using pair_type                        = pair_type<Key, Value>;
@@ -154,7 +160,7 @@ struct gpu_versioned_btree {
   void find(const Key* keys,
             Value* values,
             const size_type num_keys,
-            size_type timestamp,
+            snapshot_type timestamp,
             cudaStream_t stream = 0,
             bool concurrent     = false) const {
     const uint32_t block_size = 512;
@@ -199,7 +205,7 @@ struct gpu_versioned_btree {
                    size_type* counts,
                    const size_type average_range_length,
                    const size_type num_keys,
-                   size_type timestamp,
+                   snapshot_type timestamp,
                    cudaStream_t stream = 0,
                    bool concurrent     = false) {
     const uint32_t block_size = 512;
@@ -294,11 +300,15 @@ struct gpu_versioned_btree {
   }
 
   // takes a snapshot and returns the old snapshot index
-  size_type take_snapshot(const cudaStream_t stream = 0) {
+  snapshot_type take_snapshot(const cudaStream_t stream = 0) {
     kernels::take_snapshot_kernel<<<1, 1, 0, stream>>>(*this);
-    size_type current_ts;
-    cuda_try(cudaMemcpy(&current_ts, d_snapshot_index_, sizeof(size_type), cudaMemcpyDeviceToHost));
-    return current_ts - 1;
+    snapshot_index_type current_ts;
+    cuda_try(
+        cudaMemcpy(&current_ts, d_snapshot_index_, sizeof(snapshot_index_type), cudaMemcpyDeviceToHost));
+    assert(current_ts > 0);
+    auto previous_ts = current_ts - 1;
+    assert(previous_ts < static_cast<snapshot_index_type>(invalid_timestamp_));
+    return static_cast<snapshot_type>(previous_ts);
   }
 
   // Device-side APIs
@@ -330,17 +340,27 @@ struct gpu_versioned_btree {
 
   // takes a snapshot and returns the old snapshot index
   template <typename tile_type>
-  DEVICE_QUALIFIER size_type take_snapshot(const tile_type& tile) {
+  DEVICE_QUALIFIER snapshot_type take_snapshot(const tile_type& tile) {
     static constexpr int elected_lane = 0;
-    size_type cur_ts;
-    cuda_memory<uint32_t>::atomic_thread_fence();
+    snapshot_index_type cur_ts_full = 0;
+    cuda_memory<snapshot_index_type>::atomic_thread_fence();
 
     if (tile.thread_rank() == elected_lane) {
-      cur_ts = get_current_version();
-      cur_ts = atomicCAS(d_snapshot_index_, cur_ts, cur_ts + 1);
+      auto snapshot_limit = static_cast<snapshot_index_type>(invalid_timestamp_);
+      while (true) {
+        cur_ts_full =
+            cuda_memory<snapshot_index_type>::load(d_snapshot_index_,
+                                                   cuda_memory_order::memory_order_relaxed);
+        if (cur_ts_full >= snapshot_limit) { asm volatile("trap;"); }
+        auto observed = static_cast<snapshot_index_type>(atomicCAS(
+            reinterpret_cast<unsigned long long*>(d_snapshot_index_),
+            static_cast<unsigned long long>(cur_ts_full),
+            static_cast<unsigned long long>(cur_ts_full + 1)));
+        if (observed == cur_ts_full) { break; }
+      }
     }
-    auto snapshot_index = tile.shfl(cur_ts, elected_lane);
-    return snapshot_index;
+    cur_ts_full = tile.shfl(cur_ts_full, elected_lane);
+    return static_cast<snapshot_type>(cur_ts_full);
   }
 
   template <typename tile_type, typename DeviceAllocator>
@@ -348,7 +368,7 @@ struct gpu_versioned_btree {
                                           const tile_type& tile,
                                           DeviceAllocator& allocator,
                                           bool concurrent = false) {
-    size_type ts = invalid_timestamp_;
+    snapshot_type ts = invalid_timestamp_;
     return cooperative_find(key, tile, allocator, ts, concurrent);
   }
 
@@ -357,7 +377,7 @@ struct gpu_versioned_btree {
                                           const tile_type& tile,
                                           DeviceAllocator& allocator,
                                           bool concurrent = false) {
-    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
     auto current_node_index = *d_root_index_;
     while (true) {
       node_type current_node = node_type(
@@ -395,7 +415,7 @@ struct gpu_versioned_btree {
                                           const tile_type& tile,
                                           DeviceAllocator& allocator,
                                           DeviceReclaimer& reclaimer) {
-    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
     auto current_node_index = *d_root_index_;
     while (true) {
       node_type current_node = node_type(
@@ -439,10 +459,10 @@ struct gpu_versioned_btree {
   DEVICE_QUALIFIER Value cooperative_find(const Key& key,
                                           const tile_type& tile,
                                           DeviceAllocator& allocator,
-                                          const size_type& timestamp,
+                                          const snapshot_type& timestamp,
                                           bool concurrent = false) {
     auto value              = invalid_value;
-    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
     auto current_node_index = *d_root_index_;
     while (true) {
       node_type current_node = node_type(
@@ -479,15 +499,15 @@ struct gpu_versioned_btree {
   DEVICE_QUALIFIER Value concurrent_cooperative_find(const Key& key,
                                                      const tile_type& tile,
                                                      DeviceAllocator& allocator,
-                                                     const size_type& timestamp) {
+                                                     const snapshot_type& timestamp) {
     auto value              = invalid_value;
-    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
     auto current_node_index = *d_root_index_;
     while (true) {
       node_type current_node = node_type(
           reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)), tile);
       current_node.load(cuda_memory_order::memory_order_relaxed);
-      traverse_version_list(current_node, timestamp, tile, allocator);
+      traverse_version_list(current_node, current_node_index, timestamp, tile, allocator);
       bool is_leaf   = current_node.is_leaf();
       bool is_locked = current_node.is_locked();
       if (is_leaf) {
@@ -506,9 +526,9 @@ struct gpu_versioned_btree {
                                                                 const Key& upper_bound,
                                                                 const tile_type& tile,
                                                                 DeviceAllocator& allocator,
-                                                                const size_type& timestamp,
+                                                                const snapshot_type& timestamp,
                                                                 pair_type* buffer = nullptr) {
-    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type         = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
     auto current_node_index = *d_root_index_;
     size_type count         = 0;
     while (true) {
@@ -564,7 +584,7 @@ struct gpu_versioned_btree {
                                                                   const tile_type& tile,
                                                                   DeviceAllocator& allocator,
                                                                   MemoryReclaimer& reclaimer) {
-    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
 
     auto root_index         = *d_root_index_;
     auto current_node_index = root_index;
@@ -822,18 +842,160 @@ struct gpu_versioned_btree {
   }
 
   template <typename tile_type, typename DeviceAllocator>
+  DEVICE_NOINLINE_QUALIFIER bool handle_in_place_intermediate_split(
+      const Key& key,
+      const snapshot_type current_timestamp,
+      const size_type root_index,
+      size_type& current_node_index,
+      size_type& parent_index,
+      btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>& current_node,
+      bool& is_leaf,
+      const tile_type& tile,
+      DeviceAllocator& allocator) {
+    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
+    auto parent_node =
+        node_type(reinterpret_cast<pair_type*>(allocator.address(allocator_, parent_index)), tile);
+    parent_node.lock();
+    parent_node.load(cuda_memory_order::memory_order_relaxed);
+    bool parent_is_full = parent_node.is_full();
+
+    if (parent_is_full) {
+      current_node.unlock();
+      parent_node.unlock();
+      current_node_index = root_index;
+      parent_index       = root_index;
+      return false;
+    }
+
+    auto parent_is_correct = parent_node.ptr_is_in_node(current_node_index);
+    if (!parent_is_correct) {
+      current_node.unlock();
+      parent_node.unlock();
+      current_node_index = root_index;
+      parent_index       = root_index;
+      return false;
+    }
+
+    size_type old_parent_index = invalid_value;
+    size_type old_node_index   = invalid_value;
+    auto parent_node_timestamp  = parent_node.get_version_number();
+    auto current_node_timestamp = current_node.get_version_number();
+    if (current_timestamp != parent_node_timestamp) {
+      old_parent_index = allocator.allocate(allocator_, 1, tile);
+      parent_node.store_unlocked_copy_at(
+          reinterpret_cast<pair_type*>(allocator.address(allocator_, old_parent_index)));
+    }
+    if (current_timestamp != current_node_timestamp) {
+      old_node_index = allocator.allocate(allocator_, 1, tile);
+      current_node.store_unlocked_copy_at(
+          reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
+    }
+    auto go_right          = current_node.key_is_in_upperhalf(key);
+    size_type sibling_index = allocator.allocate(allocator_, 1, tile);
+    auto split_result       = current_node.split(
+        sibling_index,
+        parent_index,
+        reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index)),
+        reinterpret_cast<pair_type*>(allocator.address(allocator_, parent_index)),
+        true);
+
+    if (current_timestamp != parent_node_timestamp) {
+      split_result.parent.set_version_ptr_data(current_timestamp, old_parent_index);
+    }
+
+    if (current_timestamp != current_node_timestamp) {
+      split_result.sibling.set_version_ptr_data(current_timestamp, old_node_index);
+      current_node.set_version_ptr_data(current_timestamp, old_node_index);
+    }
+    split_result.sibling.store(cuda_memory_order::memory_order_relaxed);
+    __threadfence();
+    current_node.store(cuda_memory_order::memory_order_relaxed);
+    __threadfence();
+    split_result.parent.store(cuda_memory_order::memory_order_relaxed);
+    split_result.parent.unlock();
+
+    if (go_right) {
+      current_node_index = sibling_index;
+      current_node.unlock();
+      current_node = split_result.sibling;
+    } else {
+      split_result.sibling.unlock();
+    }
+
+    is_leaf = current_node.is_leaf();
+    if (!is_leaf) { current_node.unlock(); }
+    return true;
+  }
+
+  template <typename tile_type, typename DeviceAllocator>
+  DEVICE_NOINLINE_QUALIFIER void handle_in_place_root_split(
+      const Key& key,
+      const snapshot_type current_timestamp,
+      const size_type root_index,
+      size_type& current_node_index,
+      size_type& parent_index,
+      btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>& current_node,
+      bool& is_leaf,
+      const tile_type& tile,
+      DeviceAllocator& allocator) {
+    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
+    auto sibling_index0         = allocator.allocate(allocator_, 1, tile);
+    auto sibling_index1         = allocator.allocate(allocator_, 1, tile);
+    auto current_node_timestamp = current_node.get_version_number();
+
+    size_type old_node_index = invalid_value;
+    if (current_timestamp != current_node_timestamp) {
+      old_node_index = allocator.allocate(allocator_, 1, tile);
+      current_node.store_unlocked_copy_at(
+          reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
+    }
+
+    auto two_siblings =
+        current_node.split_as_root(sibling_index0,
+                                   sibling_index1,
+                                   reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index0)),
+                                   reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index1)),
+                                   true);
+
+    if (current_timestamp != current_node_timestamp) {
+      current_node.set_version_ptr_data(current_timestamp, old_node_index);
+      two_siblings.right.set_version_ptr_data(current_timestamp, invalid_value);
+      two_siblings.left.set_version_ptr_data(current_timestamp, invalid_value);
+    }
+
+    two_siblings.right.store(cuda_memory_order::memory_order_relaxed);
+    __threadfence();
+    two_siblings.left.store(cuda_memory_order::memory_order_relaxed);
+    __threadfence();
+    current_node.store(cuda_memory_order::memory_order_relaxed);
+    current_node.unlock();
+
+    current_node_index = current_node.find_next(key);
+    if (current_node_index == sibling_index0) {
+      two_siblings.right.unlock();
+      current_node = two_siblings.left;
+    } else {
+      two_siblings.left.unlock();
+      current_node = two_siblings.right;
+    }
+    parent_index = root_index;
+    is_leaf      = current_node.is_leaf();
+    if (!is_leaf) { current_node.unlock(); }
+  }
+
+  template <typename tile_type, typename DeviceAllocator>
   DEVICE_QUALIFIER bool cooperative_insert_versioned_in_place(const Key& key,
                                                               const Value& value,
                                                               const tile_type& tile,
                                                               DeviceAllocator& allocator) {
-    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
 
     auto root_index         = *d_root_index_;
     auto current_node_index = root_index;
     auto parent_index       = root_index;
     bool keep_going         = true;
     bool link_traversed     = false;
-    auto current_timestamp  = get_current_version();
+    snapshot_type current_timestamp  = get_current_version();
     do {
       auto current_node = node_type(
           reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)), tile);
@@ -932,128 +1094,27 @@ struct gpu_versioned_btree {
 
       // splitting an intermediate node
       if (is_full && (current_node_index != root_index)) {
-        auto parent_node = node_type(
-            reinterpret_cast<pair_type*>(allocator.address(allocator_, parent_index)), tile);
-        parent_node.lock();
-        parent_node.load(cuda_memory_order::memory_order_relaxed);
-        bool parent_is_full = parent_node.is_full();
-
-        // make sure parent is not full
-        if (parent_is_full) {
-          current_node.unlock();
-          parent_node.unlock();
-          current_node_index = root_index;
-          parent_index       = root_index;
-          continue;
-        }
-
-        // make sure parent is correct parent
-        auto parent_is_correct = parent_node.ptr_is_in_node(current_node_index);
-        if (!parent_is_correct) {
-          current_node.unlock();
-          parent_node.unlock();
-          current_node_index = root_index;
-          parent_index       = root_index;
-          continue;
-        }
-
-        // now it is safe to split
-        size_type old_parent_index, old_node_index;
-        auto parent_node_timestamp  = parent_node.get_version_number();
-        auto current_node_timestamp = current_node.get_version_number();
-        if (current_timestamp != parent_node_timestamp) {
-          old_parent_index = allocator.allocate(allocator_, 1, tile);
-          parent_node.store_unlocked_copy_at(
-              reinterpret_cast<pair_type*>(allocator.address(allocator_, old_parent_index)));
-        }
-        if (current_timestamp != current_node_timestamp) {
-          old_node_index = allocator.allocate(allocator_, 1, tile);
-          current_node.store_unlocked_copy_at(
-              reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
-        }
-        auto go_right = current_node.key_is_in_upperhalf(key);
-
-        size_type sibling_index = allocator.allocate(allocator_, 1, tile);
-        auto split_result       = current_node.split(
-            sibling_index,
-            parent_index,
-            reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index)),
-            reinterpret_cast<pair_type*>(allocator.address(allocator_, parent_index)),
-            true);
-
-        if (current_timestamp != parent_node_timestamp) {
-          split_result.parent.set_version_ptr_data(current_timestamp, old_parent_index);
-        }
-
-        if (current_timestamp != current_node_timestamp) {
-          split_result.sibling.set_version_ptr_data(current_timestamp, old_node_index);
-          current_node.set_version_ptr_data(current_timestamp, old_node_index);
-        }
-        split_result.sibling.store(cuda_memory_order::memory_order_relaxed);
-        __threadfence();
-        current_node.store(cuda_memory_order::memory_order_relaxed);
-        __threadfence();
-        split_result.parent.store(cuda_memory_order::memory_order_relaxed);
-        split_result.parent.unlock();
-
-        if (go_right) {
-          current_node_index = sibling_index;
-          current_node.unlock();
-          current_node = split_result.sibling;
-        } else {
-          split_result.sibling.unlock();
-        }
-
-        is_leaf = current_node.is_leaf();
-        if (!is_leaf) { current_node.unlock(); }
+        auto split_succeeded = handle_in_place_intermediate_split(key,
+                                                                  current_timestamp,
+                                                                  root_index,
+                                                                  current_node_index,
+                                                                  parent_index,
+                                                                  current_node,
+                                                                  is_leaf,
+                                                                  tile,
+                                                                  allocator);
+        if (!split_succeeded) { continue; }
 
       } else if (is_full) {
-        auto sibling_index0         = allocator.allocate(allocator_, 1, tile);
-        auto sibling_index1         = allocator.allocate(allocator_, 1, tile);
-        auto current_node_timestamp = current_node.get_version_number();
-
-        size_type old_node_index;
-        if (current_timestamp != current_node_timestamp) {
-          old_node_index = allocator.allocate(allocator_, 1, tile);
-          current_node.store_unlocked_copy_at(
-              reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
-        }
-
-        auto two_siblings =
-            current_node.split_as_root(sibling_index0,  // left node
-                                       sibling_index1,  // left right
-                                       reinterpret_cast<pair_type*>(allocator.address(
-                                           allocator_, sibling_index0)),  // left ptr
-                                       reinterpret_cast<pair_type*>(allocator.address(
-                                           allocator_, sibling_index1)),  // right ptr
-                                       true);                             // children_are_locked
-
-        // set the timestamps
-        if (current_timestamp != current_node_timestamp) {
-          current_node.set_version_ptr_data(current_timestamp, old_node_index);
-          two_siblings.right.set_version_ptr_data(current_timestamp, invalid_value);
-          two_siblings.left.set_version_ptr_data(current_timestamp, invalid_value);
-        }
-
-        two_siblings.right.store(cuda_memory_order::memory_order_relaxed);
-        __threadfence();
-        two_siblings.left.store(cuda_memory_order::memory_order_relaxed);
-        __threadfence();
-        current_node.store(cuda_memory_order::memory_order_relaxed);  // root is still locked
-        current_node.unlock();
-
-        // go right or left?
-        current_node_index = current_node.find_next(key);
-        if (current_node_index == sibling_index0) {  // go left
-          two_siblings.right.unlock();
-          current_node = two_siblings.left;
-        } else {  // go right
-          two_siblings.left.unlock();
-          current_node = two_siblings.right;
-        }
-        parent_index = root_index;
-        is_leaf      = current_node.is_leaf();
-        if (!is_leaf) { current_node.unlock(); }
+        handle_in_place_root_split(key,
+                                   current_timestamp,
+                                   root_index,
+                                   current_node_index,
+                                   parent_index,
+                                   current_node,
+                                   is_leaf,
+                                   tile,
+                                   allocator);
       }
 
       // traversal and insertion
@@ -1085,8 +1146,13 @@ struct gpu_versioned_btree {
     return true;
   }
 
-  DEVICE_QUALIFIER size_type get_current_version() {
-    return cuda_memory<size_type>::load(d_snapshot_index_, cuda_memory_order::memory_order_relaxed);
+  DEVICE_QUALIFIER snapshot_type get_current_version() {
+    auto cur_ts_full = cuda_memory<snapshot_index_type>::load(d_snapshot_index_,
+                                                              cuda_memory_order::memory_order_relaxed);
+    if (cur_ts_full >= static_cast<snapshot_index_type>(invalid_timestamp_)) {
+      asm volatile("trap;");
+    }
+    return static_cast<snapshot_type>(cur_ts_full);
   }
 
   void copy_tree_to_host(std::size_t bytes_count) {
@@ -1287,7 +1353,7 @@ struct gpu_versioned_btree {
         dot << "<td port = \"f" << lane << "\" ";
         dot << "border=\"1\"";
         if (ptr_lane) {
-          dot << " bgcolor=\"#00BFFF	\"";
+          dot << " bgcolor=\"#00BFFF    \"";
         } else if (ts_lane) {
           dot << " bgcolor=\"#00FFFF\"";
         } else if (is_locked) {
@@ -1343,7 +1409,7 @@ struct gpu_versioned_btree {
   }
   void plot_dot(std::string fname,
                 const bool plot_links    = true,
-                const uint32_t timestamp = invalid_timestamp_) {
+                const snapshot_type timestamp = invalid_timestamp_) {
     auto num_nodes = get_num_tree_node();
     h_btree_       = new pair_type[num_nodes * branching_factor];
     copy_tree_to_host(num_nodes * branching_factor * (sizeof(Key) + sizeof(Value)));
@@ -1353,10 +1419,8 @@ struct gpu_versioned_btree {
     dot << "forcelabels=true" << std::endl;
     dot << "\t node [height=.05 shape=record]" << std::endl;
     for (size_type node = 0; node < num_nodes; node++) {
-      auto node_ts = h_btree_[node * branching_factor + branching_factor - 2].first;
-      // auto plot_box_only = (timestamp != invalid_timestamp_) && (timestamp !=
-      // node_ts); plot_node(dot, &h_btree_[node * branching_factor], node, plot_links,
-      // plot_box_only);
+      auto ver_pair = h_btree_[node * branching_factor + branching_factor - 2];
+      snapshot_type node_ts = static_cast<snapshot_type>(ver_pair.first);
       if (timestamp == invalid_timestamp_ || timestamp == node_ts) {
         plot_node(dot, &h_btree_[node * branching_factor], node, plot_links);
       }
@@ -1454,15 +1518,10 @@ struct gpu_versioned_btree {
   DEVICE_QUALIFIER void allocate_root_node(const tile_type& tile, DeviceAllocator& allocator) {
     auto root_index = allocator.allocate(allocator_, 1, tile);
     *d_root_index_  = root_index;
-    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor>;
+    using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
 
     auto lane_pair = pair_type();
     if (tile.thread_rank() == 0) { lane_pair = pair_type{0, 0}; }
-    if (tile.thread_rank() == node_type::version_lane_) {
-      auto version    = get_current_version();
-      lane_pair       = {};
-      lane_pair.first = version;
-    }
     auto root_node =
         node_type(reinterpret_cast<pair_type*>(allocator.address(allocator_, root_index)),
                   tile,
@@ -1471,6 +1530,8 @@ struct gpu_versioned_btree {
                   false);
     root_node.unset_lock_in_registers();
     root_node.set_leaf_in_registers();
+    auto version = get_current_version();
+    root_node.set_timestamp(version);
     root_node.store();
   }
 
@@ -1578,7 +1639,7 @@ struct gpu_versioned_btree {
   DEVICE_QUALIFIER bool traverse_version_list(
       node_type& current_node,
       size_type& current_node_index,
-      const size_type& timestamp,
+      const snapshot_type& timestamp,
       const tile_type& tile,
       DeviceAllocator& allocator,
       cuda_memory_order order = cuda_memory_order::memory_order_relaxed) {
@@ -1609,9 +1670,10 @@ struct gpu_versioned_btree {
     cuda_try(cudaDeviceSynchronize());
   }
   void allocate() {
-    d_snapshot_index_ = cuda_allocator<size_type>().allocate(1);
-    cuda_try(cudaMemset(d_snapshot_index_, 0x00, sizeof(size_type)));
-    snapshot_index_ = std::shared_ptr<size_type>(d_snapshot_index_, cuda_deleter<size_type>());
+    d_snapshot_index_ = cuda_allocator<snapshot_index_type>().allocate(1);
+    cuda_try(cudaMemset(d_snapshot_index_, 0x00, sizeof(snapshot_index_type)));
+    snapshot_index_ =
+        std::shared_ptr<snapshot_index_type>(d_snapshot_index_, cuda_deleter<snapshot_index_type>());
 
     d_root_index_ = cuda_allocator<size_type>().allocate(1);
     cuda_try(cudaMemset(d_root_index_, 0x00, sizeof(size_type)));
@@ -1666,7 +1728,7 @@ struct gpu_versioned_btree {
                                               value_type*,
                                               const size_type,
                                               btree,
-                                              const size_type,
+                                              const typename btree::snapshot_type,
                                               const bool);
   template <typename key_type, typename value_type, typename size_type, typename btree>
   friend __global__ void kernels::find_kernel(const key_type*,
@@ -1682,7 +1744,7 @@ struct gpu_versioned_btree {
                                                      const size_type,
                                                      btree,
                                                      size_type*,
-                                                     const size_type,
+                                                     const typename btree::snapshot_type,
                                                      const bool);
   template <typename key_type, typename pair_type, typename size_type, typename btree>
   friend __global__ void kernels::range_query_kernel(const key_type*,
@@ -1697,10 +1759,10 @@ struct gpu_versioned_btree {
   template <typename key_type, typename size_type, typename btree>
   friend __global__ void kernels::erase_kernel(const key_type*, const size_type, btree, const bool);
 
-  std::shared_ptr<size_type> snapshot_index_;
+  std::shared_ptr<snapshot_index_type> snapshot_index_;
   std::shared_ptr<size_type> root_index_;
 
-  size_type* d_snapshot_index_;
+  snapshot_index_type* d_snapshot_index_;
 
   pair_type* h_btree_;
   size_type* h_node_count_;
@@ -1709,7 +1771,7 @@ struct gpu_versioned_btree {
 
   allocator_type allocator_;
 
-  static constexpr size_type invalid_timestamp_ = std::numeric_limits<size_type>::max();
+  static constexpr snapshot_type invalid_timestamp_ = std::numeric_limits<size_type>::max();
 
   static constexpr auto reclaimer_blocks_count_   = 80'000u;
   static constexpr auto reclaimer_buffer_size_    = 80'000'000u;  // ~4 * size/1e6 mbs
