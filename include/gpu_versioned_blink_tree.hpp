@@ -890,7 +890,7 @@ struct gpu_versioned_btree {
       current_node.store_unlocked_copy_at(
           reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
     }
-    auto go_right          = current_node.key_is_in_upperhalf(key);
+    auto go_right           = current_node.key_is_in_upperhalf(key);
     size_type sibling_index = allocator.allocate(allocator_, 1, tile);
     auto split_result       = current_node.split(
         sibling_index,
@@ -939,9 +939,9 @@ struct gpu_versioned_btree {
       const tile_type& tile,
       DeviceAllocator& allocator) {
     using node_type = btree_versioned_node<pair_type, tile_type, branching_factor, snapshot_type>;
-    auto sibling_index0         = allocator.allocate(allocator_, 1, tile);
-    auto sibling_index1         = allocator.allocate(allocator_, 1, tile);
-    auto current_node_timestamp = current_node.get_version_number();
+    auto sibling_index0          = allocator.allocate(allocator_, 1, tile);
+    auto sibling_index1          = allocator.allocate(allocator_, 1, tile);
+    auto current_node_timestamp  = current_node.get_version_number();
 
     size_type old_node_index = invalid_value;
     if (current_timestamp != current_node_timestamp) {
@@ -950,12 +950,12 @@ struct gpu_versioned_btree {
           reinterpret_cast<pair_type*>(allocator.address(allocator_, old_node_index)));
     }
 
-    auto two_siblings =
-        current_node.split_as_root(sibling_index0,
-                                   sibling_index1,
-                                   reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index0)),
-                                   reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index1)),
-                                   true);
+    auto two_siblings = current_node.split_as_root(
+        sibling_index0,
+        sibling_index1,
+        reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index0)),
+        reinterpret_cast<pair_type*>(allocator.address(allocator_, sibling_index1)),
+        true);
 
     if (current_timestamp != current_node_timestamp) {
       current_node.set_version_ptr_data(current_timestamp, old_node_index);
@@ -1094,16 +1094,17 @@ struct gpu_versioned_btree {
 
       // splitting an intermediate node
       if (is_full && (current_node_index != root_index)) {
-        auto split_succeeded = handle_in_place_intermediate_split(key,
-                                                                  current_timestamp,
-                                                                  root_index,
-                                                                  current_node_index,
-                                                                  parent_index,
-                                                                  current_node,
-                                                                  is_leaf,
-                                                                  tile,
-                                                                  allocator);
-        if (!split_succeeded) { continue; }
+        if (!handle_in_place_intermediate_split(key,
+                                                current_timestamp,
+                                                root_index,
+                                                current_node_index,
+                                                parent_index,
+                                                current_node,
+                                                is_leaf,
+                                                tile,
+                                                allocator)) {
+          continue;
+        }
 
       } else if (is_full) {
         handle_in_place_root_split(key,
